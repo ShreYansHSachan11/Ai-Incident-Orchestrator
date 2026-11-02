@@ -16,3 +16,7 @@ Incident_AI_Platform_Dashboard_Data_Formulas.pdf
 .pytest_cache/
 __pycache__/
 backend/pytest_out*.txt
+
+# Docs kept local only (only the root README is published)
+*.md
+!/README.md
