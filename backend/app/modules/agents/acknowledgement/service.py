@@ -1,0 +1,116 @@
+"""
+Acknowledgement Service Orchestrator.
+
+Flow:
+  1. Fetch Incident context via ContextService
+  2. Run AcknowledgementAgent (evaluates intent)
+  3. Update incident state if needed
+  4. Write structured work note via WorkNoteService
+  5. Return result
+
+State changes are published to the event bus.
+PendingHandler listens for on_hold state transitions.
+"""
+import logging
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.modules.agents.base.request import AgentRequest
+from app.modules.agents.base.response import AgentResponse
+from app.modules.agents.acknowledgement.agent import AcknowledgementAgent
+from app.modules.agents.acknowledgement.schemas import (
+    IntentResult, AcknowledgementResult, IntentType
+)
+from app.modules.context.service import ContextService
+from app.modules.incidents.service import IncidentService
+from app.modules.incidents.schemas import IncidentUpdate
+from app.modules.work_notes.service import WorkNoteService
+from app.modules.work_notes.enums import WorkNoteSourceType, WorkNoteActionType
+from app.modules.agents.acknowledgement.template_renderer import TemplateRenderer
+
+logger = logging.getLogger(__name__)
+
+
+class AcknowledgementService:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self.incident_service = IncidentService(db)
+        self.context_service = ContextService(db)
+        self.work_note_svc = WorkNoteService(db)
+        self.agent = AcknowledgementAgent()
+        self.renderer = TemplateRenderer()
+
+    async def process_acknowledgement(self, incident_id: str) -> AgentResponse:
+        incident = await self.incident_service.get_incident(incident_id)
+        context = await self.context_service.build_for_incident(incident_id=incident.id)
+
+        request = AgentRequest(context=context)
+        agent_response = await self.agent.run(request)
+
+        if not agent_response.success:
+            return agent_response
+
+        res_data = agent_response.result
+        intent_info = IntentResult(**res_data["intent_info"])
+        template_used = (
+            "salesforce_incorrect_request.html"
+            if intent_info.intent == IntentType.SALESFORCE_INCORRECT_REQUEST
+            else "standard_ack.html"
+        )
+
+        tpl_context = {
+            "ticket_number": incident.incident_number,
+            "caller_name": incident.caller or "Valued Employee",
+            "short_description": incident.short_description or "",
+            "assignment_group": incident.assignment_group or "Support Team",
+            "assigned_engineer_name": incident.assigned_to or "Assigned Engineer",
+        }
+
+        email_text = self.renderer.render_plain_text_email(template_used, tpl_context)
+
+        if intent_info.intent == IntentType.SALESFORCE_INCORRECT_REQUEST:
+            new_state = "on_hold"
+            status_desc = "Incident status updated to Pending / On Hold."
+        else:
+            new_state = incident.state
+            status_desc = f"Ticket assigned to {incident.assigned_to or 'Engineer'} ({incident.assignment_group or 'Group'})."
+
+        note_msg = (
+            f"Acknowledgement Agent executed successfully.\n"
+            f"• Classified Intent: {intent_info.intent.value} (Confidence: {intent_info.confidence:.2f})\n"
+            f"• Selected Template: {template_used}\n"
+            f"• Status: {status_desc}\n\n"
+            f"==================== EMAIL SENT TO USER ====================\n"
+            f"{email_text}\n"
+            f"============================================================"
+        )
+
+        if new_state != incident.state:
+            await self.incident_service.update_incident_internal(
+                incident.id,
+                IncidentUpdate(state=new_state),
+                changed_by="ACKNOWLEDGEMENT_AGENT",  # PendingHandler listens for this
+            )
+
+        await self.work_note_svc.add_note(
+            incident_id=incident.id,
+            message=note_msg,
+            source_type=WorkNoteSourceType.ACKNOWLEDGEMENT_AGENT,
+            source_name="AcknowledgementAgent",
+            action_type=WorkNoteActionType.SEND_ACKNOWLEDGEMENT,
+            auto_activate=False,
+        )
+
+        ack_result = AcknowledgementResult(
+            incident_id=incident.id,
+            incident_number=incident.incident_number,
+            caller=incident.caller,
+            assigned_to=incident.assigned_to,
+            assignment_group=incident.assignment_group,
+            intent_info=intent_info,
+            template_used=template_used,
+            email_sent=True,
+            delivery_status="simulated_success",
+            work_notes_added=note_msg,
+        )
+
+        agent_response.result = ack_result.model_dump()
+        return agent_response

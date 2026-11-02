@@ -1,0 +1,18 @@
+Incident_AI_Platform_Dashboard_Comprehensive_Guide.pdf
+pdf_preview_v2.png
+pdf_preview.png
+Incident_AI_Platform_Dashboard_Data_Formulas.pdf
+
+# Secrets and local environment
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+.vscode/
+
+# Python build and test artifacts
+*.egg-info/
+.pytest_cache/
+__pycache__/
+backend/pytest_out*.txt
